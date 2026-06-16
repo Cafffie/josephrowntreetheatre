@@ -16,7 +16,7 @@ import undetected_chromedriver as uc
 # CONFIG & LOGGING
 # ============================================================
 RUN_HEADLESS = False
-OUTPUT_FILE = "output.csv"
+OUTPUT_FILE = "output1.csv"
 PAGES = [
     ("https://www.josephrowntreetheatre.co.uk/whats-on/musical/", "Musical"),
     ("https://www.josephrowntreetheatre.co.uk/whats-on/play/", "Play")
@@ -102,7 +102,7 @@ def _parse_date(text: str) -> date | None:
         dt = parser.parse(text, dayfirst=True, fuzzy=True)
         if dt.date() < date.today():
             dt = dt.replace(year=dt.year + 1)
-        return dt
+        return dt.strftime("%Y-%m-%d")
     except Exception as e:
         log(f"_parse_date failed for '{text}': {e}")
         return None
@@ -124,29 +124,30 @@ def detect_currency(text):
 # ============================================================
 def _get_venue_details(driver) -> dict:
     """Extract venue address from the specific footer columns."""
-    data = {"address": None, "city": None, "country": None}
+    data = {"venue": None, "address": None, "city": None, "country": "UK"}
+
     try:
-        # Extracted directly using structural classes from page.html layout
-        address_p = driver.find_element(By.CSS_SELECTOR, "footer#footer div.footAbout p")
-        raw_text = address_p.text.strip()
-        
-        lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
-        if lines:
-            data["address"] = ", ".join(lines)
-            if len(lines) >= 3:
-                data["city"] = lines[-2]  # Usually pulls 'York'
-            else:
-                data["city"] = "York"
-            data["country"] = "UK"
+        # Wait until the container paragraph containing address details is located
+        WebDriverWait(driver, 5).until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "p.AreaAndVenueDetails")))
+        log(f"📦 Address block found inside iframe")
+    except Exception as e:
+        log(f"⚠️ Address block not found inside iframe {e}", "warning")
+
+    try:
+        # Joseph Rowntree Theatre, Haxby Road, York, YO31 8TA
+        full_address = driver.find_element(By.CSS_SELECTOR, "p.AreaAndVenueDetails").text.strip()
+        data["address"] = full_address
+
+        address_parts = [part.strip() for part in full_address.split(",")]
+        data["venue"] = driver.find_element(By.CSS_SELECTOR, ".AreaAndVenueDetails .AreaName").text.strip().rstrip(',')
+        data["city"] = address_parts[2]
+        data["country"] = "UK"
+
+        log(f"📍 Extracted Address: {data['address']}")
 
     except Exception as e:
-        log(f"⚠️ Dynamic venue extraction failed, using defaults: {e}", "warning")
-        # Reliable fallback based on actual HTML target structures
-        data = {
-            "address": "The Joseph Rowntree Theatre, Haxby Road, York, YO31 8TA",
-            "city": "York",
-            "country": "UK"
-        }
+        log(f"⚠️ Dynamic venue extraction failed: {e}", "warning")
 
     return data
 
@@ -198,9 +199,8 @@ def _extract_performances(driver) -> list[dict]:
     # Click the first book button to load the performance details 
     try:
         first_book_btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "div.DetailBanner a#linkToVenues"))
-        )
-
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "div.DetailBanner a#linkToVenues")))
+        
         first_book_btn.click()
         time.sleep(2)
         log("✅ 'First Book' button clicked successfully.")
@@ -209,19 +209,18 @@ def _extract_performances(driver) -> list[dict]:
         log(f"  Error finding first booking button: {e}")
         return []
 
-    
-
+    # wait for the performance details block to load and extract the rows 
     try:
         WebDriverWait(driver, 5).until(EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "ul.list_ticket li")))
-
-            
+   
         rows = driver.find_elements(By.CSS_SELECTOR, "ul.list_ticket li")
         log(f"📦 Found {len(rows)} performance dates")
 
         for row in rows:
             try:
-                date_element = row.find_element(By.CSS_SELECTOR, "span.DateSpan").text.strip()
+                date_element = row.find_element(By.CSS_SELECTOR, "span.DateSpan")
+                date_element = date_element.get_attribute("textContent").strip()
                 time_element = row.find_element(By.CSS_SELECTOR, "span.TimeSpan").text.strip()
                 
                 try:
@@ -231,11 +230,14 @@ def _extract_performances(driver) -> list[dict]:
                     book_link = driver.current_url
 
                 parsed_date = _parse_date(date_element)
-                if not parsed_date:
+                log(f"Date text: {date_element} | Parsed date: {parsed_date}")
+                
+                if not parsed_date or not time_element:
                     continue
 
-                perf_date = parsed_date.strftime("%Y-%m-%d")
+                perf_date = parsed_date
                 perf_time = parser.parse(time_element, fuzzy=True).strftime("%H:%M")
+                
 
                 performances.append({
                     "date": perf_date,
@@ -246,33 +248,19 @@ def _extract_performances(driver) -> list[dict]:
                 continue
 
     except Exception as e:
-        log(f"  Error extracting performances: {e}")
-        
-    # Ensuring standard compliance framework validation if strict detail views differ
-    if not performances:
-        try:
-            # Fallback placeholder derived from listing context overview text fields
-            perf_date = datetime.now().strftime("%Y-%m-%d")
-            performances.append({
-                "date": perf_date,
-                "time": "19:30",
-                "venue": venue,
-                "booking_url": driver.current_url
-            })
-        except Exception:
-            pass
-            
+        log(f"  Error extracting performances: {e}")           
     return performances
-
 
 # ============================================================
 # SEAT PRICING
 # ============================================================
 def extract_all_seats(driver, performances):
     """Extracts seats and pricing from internal ticket frame configurations."""
+    venue_details = {"venue": None, "address": None, "city": None, "country": "UK"}
+    venue_extracted = False
     seat_pricing = {}
     currency = None
-
+    
     for i, perf in enumerate(performances, start=1):
         try:
             start = time.time()
@@ -286,6 +274,12 @@ def extract_all_seats(driver, performances):
             )
             driver.switch_to.frame(iframe)
 
+            # --- SINGLE-PASS ADDRESS EXTRACTION ---
+            if not venue_extracted:
+                venue_details = _get_venue_details(driver)
+                venue_extracted = True
+            # ------------------------------------------------
+
             WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div.SeatingArea img, rect.seat"))
             )
@@ -296,6 +290,7 @@ def extract_all_seats(driver, performances):
             seat_list = []
             for seat in seats:
                 tooltip = seat.get_attribute("tooltip") or seat.get_attribute("title") or ""
+                
                 detected_currency = detect_currency(tooltip)
                 if detected_currency and currency is None:
                     currency = detected_currency
@@ -314,7 +309,7 @@ def extract_all_seats(driver, performances):
                     "ticket_price": ticket_price
                 })
 
-            perf["capacity"] = len(seats) if seats else 0
+            perf["capacity"] = len(seats) if seats else None
             key = f"{perf['date']} {perf['time']}"
             seat_pricing[key] = seat_list
 
@@ -322,7 +317,7 @@ def extract_all_seats(driver, performances):
 
         except Exception as e:
             log(f"❌ Seat extraction skipped or unavailable for current iframe context: {e}", "warning")
-            perf["capacity"] = 0
+            perf["capacity"] = None
         finally:
             try:
                 driver.switch_to.default_content()
@@ -330,7 +325,7 @@ def extract_all_seats(driver, performances):
                 pass
 
     log("✅ Seat extraction flow processed")
-    return seat_pricing, currency or "GBP"
+    return seat_pricing, currency, venue_details
 
 
 # ============================================================
@@ -364,14 +359,11 @@ def scrape_shows():
                 scroll_to_load_all(driver)
                 scrape_dt = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-                venue_details = _get_venue_details(driver)
                 raw_performances = _extract_performances(driver)
                 
                 if not raw_performances:
                     log(f"⚠️ No active performances extracted for '{show['title']}', row skipped.")
                     continue
-
-                venue = raw_performances[0].get("venue") if raw_performances else "The Joseph Rowntree Theatre"
 
                 dates = [p["date"] for p in raw_performances if p.get("date")]
                 open_date = min(dates) if dates else ""
@@ -381,7 +373,7 @@ def scrape_shows():
                     {"date": p["date"], "time": p["time"]} for p in raw_performances
                 ])
 
-                seat_pricing, currency = extract_all_seats(driver, raw_performances)
+                seat_pricing, currency, venue_details = extract_all_seats(driver, raw_performances)
                 formatted_seat_pricing = repr(seat_pricing) if seat_pricing else "{}"
 
                 capacity = max([p.get("capacity", 0) for p in raw_performances], default=0)
@@ -390,7 +382,7 @@ def scrape_shows():
                     "title": show["title"],
                     "venue_url": show["event_url"],
                     "category": show["category"],
-                    "venue": venue,
+                    "venue": venue_details["venue"],
                     "address": venue_details["address"],
                     "city": venue_details["city"],
                     "country": venue_details["country"],
@@ -399,9 +391,9 @@ def scrape_shows():
                     "booking_start_date": open_date,
                     "booking_end_date": close_date,
                     "upcoming_performances": formatted_performances,
-                    "capacity": capacity if capacity > 0 else "",
-                    "currency": currency if seat_pricing else "",
-                    "is_limited_run": True,
+                    "capacity": capacity if capacity > 0 else None,
+                    "currency": currency if seat_pricing else None,
+                    "is_limited_run": None,
                     "seat_pricing": formatted_seat_pricing,
                     "scrape_datetime": scrape_dt
                 }
